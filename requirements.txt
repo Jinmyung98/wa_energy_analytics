@@ -1,0 +1,11 @@
+# Analysis environment. Developed on Python 3.14.
+#
+# pandas and numpy versions are the ones the audit in docs/DATA_NOTES.md was
+# actually produced with. The plotting and stats pins are current releases and
+# will be re-pinned to the installed versions once the analysis notebooks run.
+pandas==2.3.3
+numpy==2.4.0
+matplotlib==3.11.1
+scipy==1.18.1
+statsmodels==0.15.0
+jupyter==1.1.1

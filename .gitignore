@@ -1,0 +1,18 @@
+# Data is downloaded, never committed. See scripts/download.sh
+data/
+
+# Notebook outputs are cleared before commit
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

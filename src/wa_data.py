@@ -33,6 +33,19 @@ Verified quirks (evidence in docs/DATA_NOTES.md):
    charging), so Operational Demand INCLUDES storage charging while Unscheduled
    Operational Demand EXCLUDES it. The gap between them is scheduled storage
    charging, which is directly useful for the battery analysis.
+
+8. facility-temperature carries NON-MEASUREMENT PLACEHOLDER SERIES. Nine of the
+   61 facility codes report a registered constant rather than a weather reading:
+   six sit at exactly 41.0 for every day on record, and three report a
+   near-constant negative sentinel (-1.401 / -1.64 / -1.636 on 968 of 973 days).
+   Two more are entirely null. These are numeric and non-null, so `notna()` does
+   not catch them and they bias every aggregate they enter. `load_temperature`
+   drops them by default; `temperature_diagnostics` shows the evidence.
+
+9. Temperature is reported PER FACILITY but measured PER STATION. The 50 genuine
+   facility series contain only 21 distinct signals - the Pinjar/Neerabup group
+   alone is 10 facility codes on one identical series. Treating facility columns
+   as independent observations multiply-counts a handful of stations.
 """
 
 from __future__ import annotations
@@ -178,25 +191,143 @@ def load_facility_scada(pattern="scada_bess/bess-*.csv", raw=None):
     return df
 
 
-def load_temperature(years=(2024, 2025, 2026), raw=None):
-    """AEMO per-facility maximum daily temperature (degC). Daily resolution only."""
+# Highest temperature ever recorded in Western Australia (Mardie, 19 Feb 1998),
+# per the Bureau of Meteorology. Used only to FLAG implausible readings, never to
+# silently clip them.
+WA_RECORD_MAX_C = 50.7
+
+# A genuine weather series in the SWIS correlates strongly with the fleet-wide
+# daily median, because the whole footprint shares one seasonal cycle. Placeholder
+# series do not. The observed gap is wide enough that the threshold is not a
+# tuning parameter: genuine series score 0.797 to 0.985, the negative sentinel
+# scores -0.096, and the constants are undefined (zero variance).
+PLACEHOLDER_CORR = 0.5
+
+
+def _temperature_raw(years=(2024, 2025, 2026), raw=None):
+    """Long-format temperature with placeholders still in. See load_temperature."""
     raw = raw or DATA_RAW
     frames = []
     for y in years:
         p = os.path.join(raw, "facility-temperature-%d.csv" % y)
         if os.path.exists(p):
             frames.append(_read(p, "Trading Date"))
-    df = pd.concat(frames, ignore_index=True)
+    if not frames:
+        raise FileNotFoundError("no facility-temperature files matched")
     return (
-        df.rename(columns={
+        pd.concat(frames, ignore_index=True)
+        .rename(columns={
             "Trading Date": "date",
             "Facility Code": "facility_code",
             "Maximum Daily Temperature": "temp_max_c",
         })
-        .dropna(subset=["temp_max_c"])
         .sort_values(["date", "facility_code"])
         .reset_index(drop=True)
     )
+
+
+def temperature_wide(years=(2024, 2025, 2026), raw=None, drop_placeholders=True):
+    """Temperature as a date x facility_code matrix."""
+    df = _temperature_raw(years, raw)
+    w = df.pivot_table(index="date", columns="facility_code", values="temp_max_c")
+    if drop_placeholders:
+        d = temperature_diagnostics(years, raw)
+        w = w[[c for c in w.columns if c in set(d.index[d.verdict == "weather"])]]
+    return w
+
+
+def temperature_diagnostics(years=(2024, 2025, 2026), raw=None):
+    """Per-facility evidence for QUIRK 8: which series are real measurements.
+
+    Returns one row per facility code with the counts the verdict rests on, so the
+    classification can be audited rather than taken on trust. `verdict` is one of:
+
+      weather     - correlates with the fleet-wide daily median (see PLACEHOLDER_CORR)
+      constant    - zero variance: a registered value repeated every day
+      sentinel    - varies, but does not track the weather; a placeholder
+      empty       - no values at all
+    """
+    df = _temperature_raw(years, raw)
+    w = df.pivot_table(index="date", columns="facility_code", values="temp_max_c")
+    # pivot_table drops facilities whose every reading is null, but those are a
+    # finding in their own right, so put the columns back as all-NaN.
+    w = w.reindex(columns=sorted(df.facility_code.unique()))
+    # Median across facilities is the reference seasonal signal. It is robust to
+    # the placeholder columns, which are a small minority of the fleet. Computed
+    # over the columns that carry data, so the all-null ones do not raise on every
+    # row of an otherwise fine calculation.
+    have = [c for c in w.columns if w[c].notna().any()]
+    ref = w[have].median(axis=1)
+
+    rows = {}
+    for c in w.columns:
+        s = w[c]
+        n, sd = int(s.notna().sum()), s.std()
+        corr = s.corr(ref) if n > 2 and sd and sd > 0 else float("nan")
+        if n == 0:
+            verdict = "empty"
+        elif not sd or sd == 0:
+            verdict = "constant"
+        elif not (corr > PLACEHOLDER_CORR):
+            verdict = "sentinel"
+        else:
+            verdict = "weather"
+        nan = float("nan")
+        rows[c] = dict(n=n, n_distinct=int(s.nunique()), std=sd, corr_fleet=corr,
+                       # guarded: reducing an all-null column warns rather than
+                       # returning NaN quietly, and "empty" is a verdict, not an error
+                       min=s.min() if n else nan,
+                       median=s.median() if n else nan,
+                       max=s.max() if n else nan,
+                       n_implausible=int((s > WA_RECORD_MAX_C).sum()),
+                       verdict=verdict)
+    return pd.DataFrame(rows).T.infer_objects().sort_values(["verdict", "corr_fleet"])
+
+
+def temperature_stations(years=(2024, 2025, 2026), raw=None):
+    """Map facility_code -> station id, collapsing QUIRK 9 duplicate series.
+
+    Facilities reporting a byte-identical series are reading the same weather
+    station. Stations are numbered by member count and named for a representative
+    member, because AEMO publishes no station identifier to name them by.
+    """
+    w = temperature_wide(years, raw, drop_placeholders=True)
+    groups = {}
+    for c in w.columns:
+        key = tuple(w[c].round(3).fillna(-999.0))
+        groups.setdefault(key, []).append(c)
+    out = {}
+    ordered = sorted(groups.values(), key=lambda v: (-len(v), sorted(v)[0]))
+    for i, members in enumerate(ordered, 1):
+        rep = sorted(members)[0]
+        name = "S%02d_%s" % (i, rep)
+        for m in members:
+            out[m] = name
+    return pd.Series(out, name="station").rename_axis("facility_code")
+
+
+def load_temperature(years=(2024, 2025, 2026), raw=None, drop_placeholders=True):
+    """AEMO per-facility maximum daily temperature (degC). Daily resolution only.
+
+    QUIRK 8: nine facility codes report registered placeholder constants rather
+    than measurements, and they are numeric and non-null. They are dropped by
+    default. Pass drop_placeholders=False for the unfiltered file, and see
+    `temperature_diagnostics` for the per-facility evidence.
+
+    QUIRK 9: the surviving facility series are not independent - use
+    `temperature_stations` to collapse them to distinct weather stations.
+
+    A `station` column is attached, and readings above the WA record of 50.7 degC
+    are flagged in `implausible` rather than dropped.
+    """
+    df = _temperature_raw(years, raw).dropna(subset=["temp_max_c"])
+    if drop_placeholders:
+        d = temperature_diagnostics(years, raw)
+        keep = set(d.index[d.verdict == "weather"])
+        df = df[df.facility_code.isin(keep)]
+        df = df.join(temperature_stations(years, raw), on="facility_code")
+    df["implausible"] = df.temp_max_c > WA_RECORD_MAX_C
+    return df.sort_values(["date", "facility_code"]).reset_index(drop=True)
 
 
 def to_trading_intervals(df, value_cols, ts="ts", how="mean"):

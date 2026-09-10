@@ -14,7 +14,7 @@ Source: `https://data.wa.aemo.com.au/public/public-data/datafiles/`
 | Reference trading price | `ReferenceTradingPrice-{2023..2026}.csv` | 30 min | 51,168 | 2023-10-01 08:00 to 2026-09-01 07:30 |
 | Storage facility SCADA | `FacilityScada-YYYY-MM.csv`, filtered to `_BESS`/`_ESR` | 5 min | 1,096,453 | 2023-10-01 08:00 to 2026-09-01 07:55 |
 | Facility registry | `facilities.csv` | n/a | 176 | snapshot |
-| Facility max daily temperature | `facility-temperature-{2024..2026}.csv` | daily | | 2024-01-01 to 2026-08-31 |
+| Facility max daily temperature | `facility-temperature-{2024..2026}.csv` | daily | 55,727 | 2024-01-02 to 2026-08-31 |
 
 ## Completeness
 
@@ -25,8 +25,11 @@ Source: `https://data.wa.aemo.com.au/public/public-data/datafiles/`
 - Storage SCADA: complete for every month once truncated downloads are re-fetched
   (see "Download integrity" below).
 
-This is unusually clean market data. The data-quality story here is not about
-holes, it is about definitions and file conventions.
+The interval data is unusually clean, and for it the data-quality story is not
+about holes but about definitions and file conventions. **The facility
+temperature file is the exception** and needs reading before use: nine of its 61
+facility codes carry registered placeholder constants rather than measurements,
+and they are numeric and non-null. See quirks 11 and 12.
 
 ## Verified quirks
 
@@ -179,6 +182,100 @@ and trimmed measures alongside the standard deviation.
 2026 (about 1.3% and 1.8% of intervals). These are manually set prices. They are
 retained in the base series but flagged, and any price result should be checked
 with them excluded.
+
+### 11. Nine facility temperature series are placeholders, not measurements
+
+`facility-temperature-*` publishes a `Maximum Daily Temperature` per facility per
+day. For nine of the 61 facility codes the value is a registered constant:
+
+| Group | Facility codes | Evidence |
+|---|---|---|
+| Constant 41.0 | `ALINTA_WWF`, `BADGINGARRA_WF1`, `MERSOLAR_PV1`, `WARRADARGE_WF1`, `YANDIN_WF1`, `SBSOLAR1_CUNDERDIN_PV1` | one distinct value across all 973 days, standard deviation exactly 0 |
+| Sentinel -1.4 | `GREENOUGH_RIVER_PV1`, `MUNGARRA_GT1`, `MUNGARRA_GT3` | 968 of 973 readings are one of `-1.401`, `-1.64`, `-1.636`; median is -1.4 in **every month of the year** |
+| Empty | `ALBANY_WF1`, `GRASMERE_WF1` | 973 rows, zero values |
+
+The first two groups are the dangerous ones, because they are numeric and
+non-null: a `notna()` filter passes all 8,785 of those readings straight through.
+41.0 is also a *plausible* WA summer maximum, so it fails only on variance.
+
+**Detection does not rely on knowing the magic values.** Every genuine SWIS
+series must track the fleet-wide daily median, because the whole footprint shares
+one seasonal cycle. Measured against it:
+
+- genuine series: correlation **0.797 to 0.985** (50 facilities)
+- the -1.4 sentinel: **-0.096**
+- the 41.0 constants: undefined, zero variance
+
+The threshold in `wa_data.PLACEHOLDER_CORR` is 0.5, sitting in an empty gap 0.89
+wide. `load_temperature` drops these series by default;
+`temperature_diagnostics` returns the per-facility evidence.
+
+**Consequence, and it is subtler than it looks:** the two defects push in
+opposite directions, so the *fleet mean* moves only +0.26 degC when they are
+included (25.60 against 25.34) and an aggregate sanity check will not catch them.
+Any per-facility or per-station figure takes the full error: `YANDIN_WF1` reports
+a 41.00 degC mean and `MUNGARRA_GT1` a -1.36 degC mean, against a fleet median of
+24.5 degC.
+
+One further reading is a genuine sensor fault rather than a placeholder:
+`EDWFMAN_WF1` reports **62.779 degC on 2024-11-22**, against the WA all-time
+record of 50.7 degC and 28.0 degC at the nearest real station the same day. Twenty
+more readings sit at 51.2 degC across the Pinjar group, marginally above the
+record. These are **flagged, not dropped** - `load_temperature` returns an
+`implausible` column - because unlike the placeholders they are single-day events
+rather than a broken series. They matter most to max-minus-min statistics: the
+one 62.8 degC value alone inflates the maximum same-day spread across stations
+from 20.7 to 41.5 degC.
+
+### 12. Temperature is reported per facility but measured per station
+
+The 50 genuine facility series contain only **21 distinct signals**. Facilities
+at the same site share one instrument, and the shared series are identical to ten
+decimal places, not merely similar:
+
+| Station | Facilities |
+|---|---|
+| Pinjar / Neerabup | 10 (`NEWGEN_NEERABUP_GT1`, `PINJAR_GT1..GT11`) |
+| Alinta Wagerup / Collie / Bluewaters / Muja | 7 |
+| Kalgoorlie / Southern Cross group | 6 |
+| Kwinana / Cockburn group | 4 |
+| six further pairs | 2 each |
+| nine single-facility sites | 1 each |
+
+**Consequence:** any analysis that treats facility columns as independent
+observations multiply-counts a handful of instruments - a correlation matrix
+across facilities is mostly measuring r = 1.0 between duplicated columns, and a
+fleet mean weights the Pinjar station ten times and Muja once.
+`temperature_stations` returns the facility-to-station mapping.
+
+Nine of the 21 stations cover under 900 of the 973 days, because they belong to
+storage facilities that commissioned mid-record. Ranking stations by mean
+temperature without a coverage filter therefore ranks late-commissioning sites
+artificially cool, for having missed two summers rather than for being cold.
+
+### 13. What the temperature data can and cannot support
+
+Established in `notebooks/EDA_facility_temperature.ipynb`, recorded here because
+it bears on how the series should be used:
+
+- **Peak demand responds to temperature as a U, not a line.** Pearson's r between
+  daily maximum temperature and daily peak operational demand is **0.27**, which
+  reads as "no relationship". Fitted as heating and cooling degree days around a
+  balance point it reaches **R-squared 0.72**. Reporting the linear correlation
+  for this pair is an error, not a weak result.
+- **The balance point is around 25 degC, and is not stable to better than a couple
+  of degrees.** A single fit on the Pinjar station returns 27.0 degC, but refitting
+  independently on each of the 18 stations with enough coverage gives a range of
+  **23.3 to 27.3 degC**, median 25.3. Quote roughly 25 degC. What *is* stable is the
+  slopes - about +90 MW per cooling degree and +81 MW per heating degree, holding
+  within 5% across weekdays, weekends and all three years.
+- **Northern-hemisphere convention does not transfer.** The usual 18 degC balance
+  point is far below anything the WA data supports.
+- **Daily resolution is a hard ceiling.** Maximum-only, once-daily values cannot
+  reach the 5-minute demand series, so peak *timing*, temperature-driven ramp
+  rates, and the overnight minima that drive multi-day heatwave load are all out
+  of scope. Reaching them needs a Bureau of Meteorology hourly source, which is a
+  different dataset with a different licence.
 
 ## Download integrity
 

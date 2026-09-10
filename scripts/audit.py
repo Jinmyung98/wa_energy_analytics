@@ -5,7 +5,8 @@ Run from the repo root after scripts/download.sh:
     python scripts/audit.py
 
 Prints coverage, completeness, duplicate checks, the demand identity check,
-the storage capacity-convention check, and the administered-price parameters.
+the storage capacity-convention check, the administered-price parameters, and
+the facility-temperature placeholder and station-duplication checks.
 Exits non-zero if a hard invariant fails.
 """
 
@@ -120,6 +121,80 @@ def main():
     print("\n  Failure Reason counts by year:")
     print(prc.pivot_table(index="failure_reason", columns="year",
                           values="ts", aggfunc="size", fill_value=0).to_string())
+
+    section("8. FACILITY TEMPERATURE: PLACEHOLDERS AND STATION DUPLICATION")
+    diag = w.temperature_diagnostics()
+    counts = diag.verdict.value_counts().to_dict()
+    print(f"  facility codes: {len(diag)}")
+    print(f"  verdicts: {counts}")
+    print()
+    print(diag[diag.verdict != "weather"][
+        ["n", "n_distinct", "std", "corr_fleet", "min", "median", "max", "verdict"]
+    ].round(3).to_string())
+
+    # QUIRK 11. The classification must stay separable without hand-tuning: the
+    # worst genuine series must sit well above the threshold, and every rejected
+    # series well below it.
+    gen = diag.loc[diag.verdict == "weather", "corr_fleet"]
+    sent = diag.loc[diag.verdict == "sentinel", "corr_fleet"]
+    print(f"\n  genuine series correlate {gen.min():.3f} to {gen.max():.3f} "
+          f"with the fleet median")
+    print(f"  sentinel series correlate {sent.min():.3f} to {sent.max():.3f}")
+    check("temperature: 50 series classified as weather",
+          int(counts.get("weather", 0)) == 50, f"got {counts.get('weather', 0)}")
+    check("temperature: 6 constant placeholder series",
+          int(counts.get("constant", 0)) == 6, f"got {counts.get('constant', 0)}")
+    check("temperature: 3 sentinel placeholder series",
+          int(counts.get("sentinel", 0)) == 3, f"got {counts.get('sentinel', 0)}")
+    check("temperature: 2 empty series",
+          int(counts.get("empty", 0)) == 2, f"got {counts.get('empty', 0)}")
+    check("temperature: threshold separates the two populations cleanly",
+          bool(gen.min() > w.PLACEHOLDER_CORR > sent.max()),
+          f"{sent.max():.3f} < {w.PLACEHOLDER_CORR} < {gen.min():.3f}")
+    check("temperature: the constants really are constant",
+          bool((diag.loc[diag.verdict == "constant", "std"] == 0).all()))
+
+    # The placeholders are numeric and non-null: a null check does not catch them.
+    raw_t = w.load_temperature(drop_placeholders=False)
+    bad = set(diag.index[diag.verdict.isin(["constant", "sentinel"])])
+    n_bad = int(raw_t.facility_code.isin(bad).sum())
+    check("temperature: placeholder readings survive a notna() filter",
+          n_bad > 0, f"{n_bad:,} non-null readings across {len(bad)} facilities")
+
+    # And the aggregate does NOT reveal them, because they oppose each other.
+    clean_t = w.load_temperature()
+    bias = raw_t.temp_max_c.mean() - clean_t.temp_max_c.mean()
+    print(f"\n  fleet mean with placeholders {raw_t.temp_max_c.mean():.2f} C, "
+          f"without {clean_t.temp_max_c.mean():.2f} C, bias {bias:+.2f} C")
+    check("temperature: fleet mean alone would NOT expose the defect",
+          abs(bias) < 1.0, f"bias only {bias:+.2f} C -- aggregate checks are not enough")
+
+    # QUIRK 12. Facilities sharing a station are identical, not merely similar.
+    stations = w.temperature_stations()
+    wide = w.temperature_wide()
+    print(f"\n  {len(stations)} genuine facility series -> "
+          f"{stations.nunique()} distinct stations")
+    print(stations.groupby(stations).size().sort_values(ascending=False)
+          .rename("facilities").to_string())
+    worst = 0.0
+    for station, members in stations.groupby(stations).groups.items():
+        members = sorted(members)
+        for other in members[1:]:
+            worst = max(worst, float((wide[members[0]] - wide[other]).abs().max()))
+    check("temperature: 50 facility series collapse to 21 stations",
+          stations.nunique() == 21, f"got {stations.nunique()}")
+    check("temperature: shared-station series are bit-identical",
+          worst == 0.0, f"max abs difference {worst:.10f}")
+
+    # Implausible readings are flagged, not dropped.
+    imp = clean_t[clean_t.implausible]
+    print(f"\n  readings above the WA record of {w.WA_RECORD_MAX_C} C: {len(imp)}")
+    if len(imp):
+        print(imp.groupby("facility_code").temp_max_c.agg(["size", "max"])
+              .sort_values("max", ascending=False).head(3).to_string())
+    check("temperature: implausible readings are retained and flagged",
+          len(imp) > 0 and "implausible" in clean_t.columns,
+          f"{len(imp)} flagged, none dropped")
 
     section("SUMMARY")
     if FAILURES:
